@@ -1,0 +1,12 @@
+name: mdconv
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - tk
+  - pip
+  - pip:
+    - beautifulsoup4==4.12.3
+    - lxml==5.2.2
+    - markdownify==0.13.1
