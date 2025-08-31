@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import shutil
 from pathlib import Path
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
+from urllib.parse import urlparse, urlunparse
 
 
 def find_main_content(soup: BeautifulSoup, selector: str | None = None):
@@ -35,30 +37,67 @@ def relativize(from_path: Path, to_path: Path) -> str:
     return Path(rel).as_posix()
 
 
-def resolve_href(base_html_path: Path, href: str) -> Path | None:
-    # Ignore empty and hash-only anchors
-    if not href or href.startswith('#'):
+def resolve_href(base_html_path: Path, href: str) -> tuple[Path, str, str] | None:
+    """Resolve href into absolute filesystem path and return (abs_path, fragment, query).
+
+    External protocols return None.
+    Hash-only anchors return None.
+    """
+    if not href:
         return None
-    # Protocols we leave unchanged (mailto:, http:, https:, data:)
-    lowered = href.lower()
-    if any(lowered.startswith(pfx) for pfx in ('http://', 'https://', 'mailto:', 'tel:', 'data:')):
+    parsed = urlparse(href)
+    if parsed.scheme in ('http', 'https', 'mailto', 'tel', 'data'):
         return None
-    # Make it absolute based on the input html file location
-    return (base_html_path.parent / href).resolve()
+    if not parsed.path and parsed.fragment:
+        # hash-only anchor
+        return None
+    abs_path = (base_html_path.parent / (parsed.path or '')).resolve()
+    return abs_path, parsed.fragment, parsed.query
 
 
-def preprocess_links_and_images(content: BeautifulSoup, in_html: Path, out_md: Path):
-    # Images: keep source images in place; make markdown point to correct relative path from out_md
+def copy_image_to_output(abs_img: Path, out_md: Path, out_root: Path) -> str:
+    """Copy image to a dedicated 'images' folder in the output root and return the new relative path."""
+    # Define a dedicated images directory in the output root
+    out_images_dir = out_root / 'images'
+    out_images_dir.mkdir(parents=True, exist_ok=True)
+
+    # Handle potential filename conflicts
+    out_img_path = out_images_dir / abs_img.name
+    counter = 1
+    while out_img_path.exists():
+        out_img_path = out_images_dir / f"{abs_img.stem}-{counter}{abs_img.suffix}"
+        counter += 1
+
+    # Copy the image, preserving metadata
+    shutil.copy2(abs_img, out_img_path)
+
+    # Return the new relative path from the Markdown file to the copied image
+    return relativize(out_md, out_img_path)
+
+
+def preprocess_links_and_images(content: BeautifulSoup, in_html: Path, out_md: Path, out_root: Path):
+    # Images: copy to output directory and update paths
     for img in content.find_all('img'):
         src = img.get('src')
         if not src:
             continue
-        abs_img = resolve_href(in_html, src)
-        if abs_img is None:
+        resolved = resolve_href(in_html, src)
+        if resolved is None:
             # leave external/data URIs unchanged
             continue
-        # Compute rel path from output markdown location to the absolute image path
-        new_src = relativize(out_md, abs_img)
+        abs_img, frag, query = resolved
+        
+        # Check if image file exists
+        if abs_img.exists() and abs_img.is_file():
+            # Copy image and get new relative path
+            new_src = copy_image_to_output(abs_img, out_md, out_root)
+        else:
+            # Image doesn't exist, keep original relative path
+            new_src = relativize(out_md, abs_img)
+        
+        # Re-append query/fragment if present
+        if query or frag:
+            new_src = urlunparse(('', '', new_src, '', query, f'#{frag}' if frag else ''))
         img['src'] = new_src
 
     # Links: convert internal .html links to .md and fix relative path
@@ -66,21 +105,23 @@ def preprocess_links_and_images(content: BeautifulSoup, in_html: Path, out_md: P
         href = a.get('href')
         if not href:
             continue
-        # Allow same-page anchors
-        if href.startswith('#'):
-            continue
-        abs_target = resolve_href(in_html, href)
-        if abs_target is None:
+        # Same-page anchors handled in resolve_href
+        resolved = resolve_href(in_html, href)
+        if resolved is None:
             # external link, leave as-is
             continue
+        abs_target, frag, query = resolved
         # If it points to an HTML file inside the pack, switch to .md
         if abs_target.suffix.lower() in {'.html', '.htm'}:
             abs_target_md = abs_target.with_suffix('.md')
             new_href = relativize(out_md, abs_target_md)
-            a['href'] = new_href
         else:
             # Non-HTML target: still fix relative path so it doesn't break
-            a['href'] = relativize(out_md, abs_target)
+            new_href = relativize(out_md, abs_target)
+        # Re-append query/fragment if present
+        if query or frag:
+            new_href = urlunparse(('', '', new_href, '', query, f'#{frag}' if frag else ''))
+        a['href'] = new_href
 
 
 def html_to_markdown(html_str: str) -> str:
@@ -107,7 +148,7 @@ def convert_file(in_path: Path, out_root: Path, in_root: Path, main_selector: st
     content = find_main_content(soup, main_selector)
 
     # Preprocess links and images so markdown gets correct targets
-    preprocess_links_and_images(content, in_path, out_path)
+    preprocess_links_and_images(content, in_path, out_path, out_root)
 
     md_text = html_to_markdown(str(content))
 
